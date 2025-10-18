@@ -97,14 +97,14 @@ url: The YouTube video URL to process (required).
 --skip-download: Optional flag to skip downloading if both the video and MP3 files already exist in the working directory.
 
 Example
-python TranscriptExtractor.py "https://www.youtube.com/watch?v=RRWC8KRPDVQ"
+python TranscriptExtractor.py "https://www.youtube.com/watch?v=example_id"
 
 This processes the video, generating files like:
 
-Video: Larissa_Dali_(Actress,_Deadly_Escape)_-_The_Patrick_Scott_Patterson_Project_Episode_#11.m4a
-MP3: Larissa_Dali_(Actress,_Deadly_Escape)_-_The_Patrick_Scott_Patterson_Project_Episode_#11.mp3
-WAV: Larissa_Dali_(Actress,_Deadly_Escape)_-_The_Patrick_Scott_Patterson_Project_Episode_#11.wav
-Transcript: Larissa_Dali_(Actress,_Deadly_Escape)_-_The_Patrick_Scott_Patterson_Project_Episode_#11_20251017_205700.txt
+Video: Example_Video_Title.m4a
+MP3: Example_Video_Title.mp3
+WAV: Example_Video_Title.wav
+Transcript: Example_Video_Title_20251017_205700.txt
 
 Output Files
 
@@ -130,15 +130,15 @@ CUDA device properties: _CudaDeviceProperties(name='NVIDIA GeForce RTX 3080', ..
 Using device: cuda:0
 
 Starting YouTube audio transcription script...
-Arguments: URL=https://www.youtube.com/watch?v=RRWC8KRPDVQ, Skip Download=False
+Arguments: URL=https://www.youtube.com/watch?v=example_id, Skip Download=False
 
 Processing audio download...
 Extracting video info without download...
-Video title: Larissa Dali (Actress, Deadly Escape) - The Patrick Scott Patterson Project Episode #11
+Video title: Example Video Title
 ...
 
 Starting speaker diarization...
-Input WAV file: Larissa_Dali_(Actress,_Deadly_Escape)_-_The_Patrick_Scott_Patterson_Project_Episode_#11.wav
+Input WAV file: Example_Video_Title.wav
 Loading diarization pipeline...
 Initializing pyannote.audio pipeline with Hugging Face token...
 Performing speaker diarization on cuda:0...
@@ -147,6 +147,9 @@ Processing segment: Speaker SPEAKER_00, Start: 0.00s, End: 2.50s, Length: 2.50s
 
 Cleanup skipped for debugging. Check MP3, WAV, and video files manually.
 Script execution completed successfully. Total execution time: 300.25 seconds.
+
+If an error occurs:
+[ERROR] in download_youtube_audio: File not found
 
 GPU Support
 The script leverages CUDA for both Whisper transcription and pyannote.audio diarization if an NVIDIA GPU is available. CUDA is checked at script start, with detailed output:
