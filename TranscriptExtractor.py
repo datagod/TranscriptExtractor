@@ -96,7 +96,7 @@ Notes:
 - Execution time is reported at the end of the script in seconds.
 - Debug output for diarization segments helps diagnose issues with short or empty segments.
 
-Author: Grok, created by xAI
+Author: William McEvoy + Grok
 Last Updated: October 16, 2025
 """
 print("")
