@@ -97,8 +97,17 @@ Notes:
 - Debug output for diarization segments helps diagnose issues with short or empty segments.
 
 Author: William McEvoy + Grok
-Last Updated: October 16, 2025
+Last Updated: October 25, 2025
+
+TranscriptExtractor v2.3
+- Local audio reuse before any network work.
+- New: --audio PATH to use an existing .mp3/.wav/.m4a and skip yt-dlp entirely.
+- Smarter auto-detection: if a matching audio file already exists in --outdir (or the per-video dir),
+  reuse it and skip download/conversion.
+- Keeps v2.2 improvements (Windows TorchCodec bypass via in-memory audio for pyannote).
 """
+
+
 print("")
 print("=========================================")
 print("= TRANSCRIPT EXTRACTOR                  =")
@@ -106,302 +115,428 @@ print("=========================================")
 print("")
 
 
-import yt_dlp
+
+import argparse
+import json
 import os
 import re
-from pydub import AudioSegment
-import whisper
 import sys
-import argparse
-from pyannote.audio import Pipeline
-from datetime import timedelta, datetime
-import torch
 import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
 
-# Perform CUDA checks at script start for immediate troubleshooting feedback
+import yt_dlp
+from pydub import AudioSegment
 
-# Track script start time
-start_time = time.time()
+import torch
+import whisper
 
-print("Starting CUDA availability check...")
-cuda_available = torch.cuda.is_available()
-print(f"CUDA available: {cuda_available}")
-if cuda_available:
-    print("SUCCESS: CUDA detected and will be used for transcription and diarization.")
-    cuda_device_count = torch.cuda.device_count()
-    print(f"Number of CUDA devices: {cuda_device_count}")
-    for i in range(cuda_device_count):
-        print(f"CUDA Device {i}: {torch.cuda.get_device_name(i)}")
-    print(f"Current CUDA device: {torch.cuda.current_device()}")
-    print(f"CUDA device properties: {torch.cuda.get_device_properties(torch.cuda.current_device())}")
-    device = torch.device("cuda")
-else:
-    print("WARNING: CUDA not available. Falling back to CPU.")
-    print("Clear reasons for no CUDA:")
-    print("- No compatible NVIDIA GPU detected in the system.")
-    print("- CUDA drivers not installed, outdated, or incompatible.")
-    print("- PyTorch installed without CUDA support. Reinstall with CUDA: e.g., pip install torch --index-url https://download.pytorch.org/whl/cu121")
-    print("- Environment configuration issues (e.g., PATH, LD_LIBRARY_PATH not set correctly).")
-    print("- Verify with: python -c 'import torch; print(torch.cuda.is_available())'")
-    device = torch.device("cpu")
-print(f"Using device: {device}")
+# Optional deps
+try:
+    import torchaudio
+    _HAS_TA = True
+except Exception:
+    _HAS_TA = False
 
-def sanitize_filename(title):
-    """Sanitize YouTube video title to create a valid filename."""
-    print(f"Sanitizing filename: {title}")
-    sanitized = re.sub(r'[<>:"/\\|?*]', '', title)
-    sanitized = re.sub(r'\s+', '_', sanitized.strip())
-    sanitized = sanitized[:200]
-    print(f"Sanitized filename: {sanitized}")
-    return sanitized
+# Optional import: only if diarization is enabled
+try:
+    from pyannote.audio import Pipeline
+    _HAS_PYANNOTE = True
+except Exception:
+    _HAS_PYANNOTE = False
 
-def download_youtube_audio(url, skip_download=False):
-    """Download audio from a YouTube URL using yt-dlp, or skip if files exist."""
-    print(f"\nStarting audio download for URL: {url}")
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def log(msg: str) -> None:
+    print(f"[{_now()}] {msg}", flush=True)
+
+def err(msg: str) -> None:
+    print(f"[{_now()}] [ERROR] {msg}", file=sys.stderr, flush=True)
+
+def sanitize_filename(text: str, maxlen: int = 160) -> str:
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "", text)
+    text = re.sub(r"\s+", "_", text.strip())
+    return text[:maxlen] if text else "untitled"
+
+def pick_device(device_arg: str) -> torch.device:
+    if device_arg == "cpu":
+        return torch.device("cpu")
+    if device_arg == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        err("Requested --device cuda but CUDA is not available. Falling back to CPU.")
+        return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def hhmmss(seconds: float) -> str:
+    td = timedelta(seconds=int(max(0, seconds)))
+    hours, remainder = divmod(int(td.total_seconds()), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:01d}:{minutes:02d}:{secs:02d}"
+
+# ---------- Audio preload to avoid TorchCodec ----------
+def load_waveform(path: Path) -> Tuple[torch.Tensor, int]:
+    """
+    Return (waveform[C,T], sample_rate). Prefer torchaudio; fallback to pydub.
+    Output dtype float32 in [-1, 1].
+    """
+    if _HAS_TA:
+        wav, sr = torchaudio.load(str(path))  # shape [C, T], dtype float32/float64
+        if wav.dtype != torch.float32:
+            wav = wav.float()
+        return wav, int(sr)
+    # Fallback via pydub -> numpy -> torch
+    seg = AudioSegment.from_file(path)
+    sr = seg.frame_rate
+    samples = seg.get_array_of_samples()
+    import numpy as np
+    arr = np.array(samples).astype("float32")
+    channels = seg.channels
+    if channels > 1:
+        arr = arr.reshape((-1, channels)).T  # [C, T]
+    else:
+        arr = arr.reshape((1, -1))
+    max_val = float(1 << (8 * seg.sample_width - 1))
+    arr = arr / max_val
+    wav = torch.from_numpy(arr)
+    return wav, int(sr)
+
+def _load_pyannote_pipeline(model_id: str, token: Optional[str], device: torch.device):
+    if token is None:
+        return Pipeline.from_pretrained(model_id).to(device)
+    last_err = None
+    for kw in ("token", "use_auth_token"):
+        try:
+            log(f"Attempting pyannote Pipeline.from_pretrained(..., {kw}=<redacted>)")
+            pipe = Pipeline.from_pretrained(model_id, **{kw: token})
+            return pipe.to(device)
+        except TypeError as e:
+            last_err = e
+        except Exception as e:
+            last_err = e
+    raise TypeError(f"pyannote Pipeline token parameter mismatch; tried token/use_auth_token. Last error: {last_err}")
+
+# ---------- Local audio resolution ----------
+AUDIO_EXTS = (".mp3", ".m4a", ".wav", ".flac", ".ogg")
+
+def _find_existing_audio(base_out: Path, title: str) -> Optional[Path]:
+    sanitized = sanitize_filename(title)
+    # Look inside outputs root and per-video dir
+    candidates = [
+        *((base_out / f"{title}{ext}") for ext in AUDIO_EXTS),
+        *((base_out / f"{sanitized}{ext}") for ext in AUDIO_EXTS),
+        *((base_out / sanitized / f"{title}{ext}") for ext in AUDIO_EXTS),
+        *((base_out / sanitized / f"{sanitized}{ext}") for ext in AUDIO_EXTS),
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file() and p.stat().st_size > 0:
+            return p
+    return None
+
+def _probe_title(url: str) -> str:
+    """Probe title without download. Minimal yt-dlp call."""
+    ydl_opts = {"quiet": True, "noprogress": True, "no_warnings": True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if not info:
+            raise RuntimeError("yt-dlp failed to retrieve video info.")
+        return info.get("title") or "audio"
+
+def resolve_audio_source(url: str, base_out: Path, explicit_audio: Optional[str]) -> Tuple[Path, str]:
+    """
+    Returns (audio_path, title). If explicit_audio is provided and exists, use it.
+    Else, probe title and reuse any existing audio in base_out/per-video dir.
+    If nothing exists, download via yt-dlp (audio-only) into base_out root.
+    """
+    base_out.mkdir(parents=True, exist_ok=True)
+
+    # 1) Explicit override
+    if explicit_audio:
+        audio_path = Path(explicit_audio).expanduser().resolve()
+        if not audio_path.exists() or not audio_path.is_file():
+            raise FileNotFoundError(f"--audio points to a non-existent file: {audio_path}")
+        title = audio_path.stem
+        log(f"--audio specified, using local file: {audio_path.name}")
+        return audio_path, title
+
+    # 2) Probe title (no download) and try to find local file
+    log("Probing video title (no download)...")
+    title = _probe_title(url)
+    existing = _find_existing_audio(base_out, title)
+    if existing:
+        log(f"Local audio found, skipping download: {existing}")
+        return existing, title
+
+    # 3) Download audio now (only if nothing found)
+    log("No local audio found. Downloading audio (yt-dlp + ffmpeg)...")
     ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',
-        'outtmpl': '%(title)s.%(ext)s',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'retries': 3,
-        'keepvideo': True,
+        "format": "bestaudio/best",
+        "outtmpl": str(base_out / "%(title)s.%(ext)s"),
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+        ],
+        "retries": 3,
+        "ignoreerrors": False,
+        "noprogress": True,
+        "quiet": True,
+        "no_warnings": True,
+        "keepvideo": True,
     }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            print("Extracting video info without download...")
-            info = ydl.extract_info(url, download=False)
-            original_filename = ydl.prepare_filename(info)
-            mp3_filename = os.path.splitext(original_filename)[0] + '.mp3'
-            video_title = info.get('title', 'audio')
-            print(f"Video title: {video_title}")
-            print(f"Expected video file: {original_filename}")
-            print(f"Expected MP3 file: {mp3_filename}")
-            print(f"Expected duration: {info.get('duration', 0)} seconds")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if not info:
+            raise RuntimeError("yt-dlp failed during download.")
+        title = info.get("title") or title
+        # Expect MP3 in base_out root
+        mp3_path = Path(ydl.prepare_filename(info)).with_suffix(".mp3")
+        if not mp3_path.exists():
+            # Try m4a as fallback (sometimes postprocessor not triggered)
+            m4a = Path(ydl.prepare_filename(info)).with_suffix(".m4a")
+            if m4a.exists():
+                mp3_path = m4a
+        if not mp3_path.exists():
+            raise FileNotFoundError("Expected audio file not created by yt-dlp.")
+        log(f"Downloaded audio: {mp3_path.name}")
+        return mp3_path, title
 
-            if skip_download:
-                if os.path.exists(original_filename) and os.path.exists(mp3_filename):
-                    print(f"Skipping download: both video ({original_filename}) and MP3 ({mp3_filename}) exist")
-                    return mp3_filename, video_title
-                else:
-                    missing = []
-                    if not os.path.exists(original_filename):
-                        missing.append(original_filename)
-                    if not os.path.exists(mp3_filename):
-                        missing.append(mp3_filename)
-                    print(f"[ERROR] Missing files for skip-download: {', '.join(missing)}")
-                    sys.exit(1)
-            else:
-                if os.path.exists(original_filename) and os.path.exists(mp3_filename):
-                    print(f"Files already exist: skipping download and using existing video ({original_filename}) and MP3 ({mp3_filename})")
-                    return mp3_filename, video_title
+def ensure_wav(audio_path: Path, out_dir: Path, title: str) -> Path:
+    sanitized = sanitize_filename(title)
+    wav_path = out_dir / f"{sanitized}.wav"
+    # If the audio_path is already a WAV matching target, reuse
+    if audio_path.suffix.lower() == ".wav":
+        if audio_path.resolve() != wav_path.resolve():
+            # copy/rename into per-video dir if needed
+            try:
+                if not wav_path.exists():
+                    audio = AudioSegment.from_file(audio_path)
+                    audio.export(wav_path, format="wav")
+            except Exception as e:
+                err(f"WAV relocate/export failed: {e}")
+        if wav_path.exists():
+            log(f"Reusing existing WAV: {wav_path.name} ({len(AudioSegment.from_file(wav_path))/1000.0:.2f}s)")
+            return wav_path
 
-                print("Downloading audio and video...")
-                ydl.download([url])
-                if not os.path.exists(mp3_filename):
-                    raise FileNotFoundError(f"[ERROR] MP3 file not found after download: {mp3_filename}")
-                if not os.path.exists(original_filename):
-                    raise FileNotFoundError(f"[ERROR] Video file not found after download: {original_filename}")
-
-        print(f"Verifying MP3 file: {mp3_filename}")
-        file_size = os.path.getsize(mp3_filename)
-        print(f"MP3 file size: {file_size} bytes")
-        audio = AudioSegment.from_file(mp3_filename)
-        duration = len(audio) / 1000.0
-        print(f"Actual MP3 duration: {duration} seconds")
-        if duration < 10:
-            raise ValueError(f"[ERROR] MP3 file is too short: {duration} seconds")
-        print("MP3 file validated successfully")
-        return mp3_filename, video_title
-    except Exception as e:
-        print(f"[ERROR] in download_youtube_audio: {e}")
-        sys.exit(1)
-
-def convert_to_wav(mp3_path, video_title):
-    """Convert MP3 audio to WAV format using pydub, skip if valid WAV exists."""
-    sanitized_title = sanitize_filename(video_title)
-    wav_path = f"{sanitized_title}.wav"
-    print(f"\nStarting MP3 to WAV conversion...")
-    print(f"Input MP3 file: {mp3_path}")
-    print(f"Target WAV file: {wav_path}")
-    try:
-        if os.path.exists(wav_path):
-            print(f"Existing WAV file found: {wav_path}")
-            audio = AudioSegment.from_file(wav_path)
-            duration = len(audio) / 1000.0
-            print(f"Existing WAV duration: {duration} seconds")
-            if duration >= 10:
-                print("Existing WAV file validated successfully. Skipping conversion.")
+    if wav_path.exists():
+        try:
+            dur = len(AudioSegment.from_file(wav_path)) / 1000.0
+            if dur >= 10:
+                log(f"Reusing existing WAV: {wav_path.name} ({dur:.2f}s)")
                 return wav_path
-            else:
-                print(f"Warning: Existing WAV file too short: {duration} seconds. Re-converting...")
+        except Exception:
+            pass
 
-        if not os.path.exists(mp3_path):
-            raise FileNotFoundError(f"[ERROR] MP3 file not found: {mp3_path}")
-        print("Loading MP3 file with pydub...")
-        audio = AudioSegment.from_file(mp3_path)
-        duration = len(audio) / 1000.0
-        print(f"MP3 duration: {duration} seconds")
-        if duration < 10:
-            raise ValueError(f"[ERROR] MP3 file is too short: {duration} seconds")
-        print("Exporting audio to WAV format...")
-        audio.export(wav_path, format="wav")
-        if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
-            raise ValueError("[ERROR] WAV file creation failed or is empty")
-        print(f"WAV file created: {wav_path}")
-        print(f"WAV file size: {os.path.getsize(wav_path)} bytes")
-        return wav_path
-    except Exception as e:
-        print(f"[ERROR] in converting to WAV: {e}")
-        sys.exit(1)
+    log(f"Converting → WAV: {audio_path.name} → {wav_path.name}")
+    audio = AudioSegment.from_file(audio_path)
+    audio.export(wav_path, format="wav")
+    if not wav_path.exists() or wav_path.stat().st_size == 0:
+        raise RuntimeError("WAV export failed or produced empty file.")
+    return wav_path
 
-def diarize_audio(wav_path):
-    """Perform speaker diarization using pyannote.audio with GPU support if available."""
-    print(f"\nStarting speaker diarization...")
-    print(f"Input WAV file: {wav_path}")
+def safe_move(src: Path, dst: Path):
     try:
-        print("Loading diarization pipeline...")
-        hf_token = os.getenv("HF_TOKEN")
-        if not hf_token:
-            raise ValueError("[ERROR] HF_TOKEN environment variable not set. Please set it to your Hugging Face access token.")
-        print("Initializing pyannote.audio pipeline with Hugging Face token...")
-        pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1",
-                                          use_auth_token=hf_token).to(device)
-        print(f"Performing speaker diarization on {device}...")
-        diarization = pipeline(wav_path)
-        segments = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            segment_length = turn.end - turn.start
-            print(f"Processing segment: Speaker {speaker}, Start: {turn.start:.2f}s, End: {turn.end:.2f}s, Length: {segment_length:.2f}s")
-            if segment_length < 0.1:
-                print(f"Warning: Very short segment detected ({segment_length:.2f}s)")
-            segments.append({
-                "start": turn.start,
-                "end": turn.end,
-                "speaker": speaker
-            })
-        unique_speakers = len(set(s['speaker'] for s in segments))
-        print(f"Diarization complete. Detected {unique_speakers} unique speakers")
-        return segments
+        if src.resolve() == dst.resolve():
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            return  # ignore
+        src.rename(dst)
     except Exception as e:
-        print(f"[ERROR] in diarization: {e}")
-        sys.exit(1)
+        err(f"Non-fatal move error: {e}")
 
-def transcribe_audio(wav_path, model_name="base"):
-    """Transcribe WAV audio using Whisper model with timestamps."""
-    print(f"\nStarting audio transcription...")
-    print(f"Input WAV file: {wav_path}")
-    print(f"Whisper model: {model_name}")
+def diarize(wav_path: Path, device: torch.device, hf_token: Optional[str], model_id: str, max_speakers: Optional[int]):
+    if not _HAS_PYANNOTE:
+        raise RuntimeError("pyannote.audio not installed; install it or use --no-diarization.")
+    # Try to detect installed pyannote version (for v3 vs v4 output handling)
     try:
-        if not os.path.exists(wav_path):
-            raise FileNotFoundError(f"[ERROR] WAV file not found: {wav_path}")
-        print(f"Loading Whisper model: {model_name}...")
-        model = whisper.load_model(model_name, device=device)
-        print(f"Whisper model loaded successfully on {device}")
-        print("Transcribing audio...")
-        result = model.transcribe(wav_path, verbose=True)
-        print(f"Transcription complete. Number of segments: {len(result['segments'])}")
-        for i, segment in enumerate(result["segments"], 1):
-            print(f"Segment {i}: Start: {segment['start']:.2f}s, End: {segment['end']:.2f}s, Text: {segment['text'].strip()}")
-        return result["segments"]
-    except Exception as e:
-        print(f"[ERROR] in transcribing audio: {e}")
-        sys.exit(1)
+        import pyannote.audio as _pya
+        _pya_ver = getattr(_pya, "__version__", "unknown")
+    except Exception:
+        _pya_ver = "unknown"
 
-def align_transcript_with_speakers(transcript_segments, diarization_segments):
-    """Align Whisper transcript segments with diarization speaker labels."""
-    print(f"\nStarting alignment of transcript with speaker labels...")
-    print(f"Number of transcript segments: {len(transcript_segments)}")
-    print(f"Number of diarization segments: {len(diarization_segments)}")
-    aligned_transcript = []
-    for i, t_segment in enumerate(transcript_segments, 1):
-        t_start = t_segment["start"]
-        t_end = t_segment["end"]
-        text = t_segment["text"].strip()
-        if not text:
-            print(f"Skipping empty transcript segment {i} at {t_start:.2f}s")
+    token = hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    log(f"Loading diarization pipeline '{model_id}' on {device} (pyannote.audio={_pya_ver}) ...")
+    pipe = _load_pyannote_pipeline(model_id, token, device)
+
+    # Preload audio to avoid TorchCodec/AudioDecoder path
+    wav, sr = load_waveform(wav_path)
+    wav = wav.to(device) if device.type == "cuda" else wav
+    inputs = {"waveform": wav, "sample_rate": sr}
+
+    # Run pipeline
+    output = pipe(inputs) if max_speakers is None else pipe(inputs, num_speakers=max_speakers)
+
+    # Normalize output across pyannote versions
+    annotation = None
+    # pyannote >=4 returns a DiarizeOutput with .speaker_diarization / .exclusive_speaker_diarization
+    if hasattr(output, "speaker_diarization"):
+        annotation = output.speaker_diarization
+    # pyannote 3.x returns an Annotation directly
+    elif hasattr(output, "itertracks"):
+        annotation = output
+    # sometimes dict-like
+    elif isinstance(output, dict) and "speaker_diarization" in output:
+        annotation = output["speaker_diarization"]
+    else:
+        raise TypeError(f"Unexpected pyannote output type: {type(output)}; upgrade script or pin pyannote to ~=3.1")
+
+    segments: List[Dict[str, Any]] = []
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
+        start, end = float(turn.start), float(turn.end)
+        if end <= start:
             continue
-        max_overlap = 0
-        best_speaker = "Unknown"
-        for d_segment in diarization_segments:
-            d_start = d_segment["start"]
-            d_end = d_segment["end"]
-            overlap_start = max(t_start, d_start)
-            overlap_end = min(t_end, d_end)
-            overlap = max(0, overlap_end - overlap_start)
+        segments.append({"start": start, "end": end, "speaker": str(speaker)})
+    segments.sort(key=lambda s: (s["start"], s["end"]))
+    uniq = len({s["speaker"] for s in segments})
+    log(f"Diarization complete: {len(segments)} segments, ~{uniq} speaker labels.")
+    return segments
+
+def transcribe(wav_path: Path, device: torch.device, model_name: str, language: Optional[str]):
+    log(f"Loading Whisper model '{model_name}' on {device} ...")
+    model = whisper.load_model(model_name, device=str(device))
+    result = model.transcribe(str(wav_path), verbose=False, language=language)
+    segs = result.get("segments") or []
+    log(f"Transcription complete: {len(segs)} segments.")
+    return segs
+
+def align(transcript: List[Dict[str, Any]], diar: List[Dict[str, Any]]):
+    if not diar:
+        return [
+            {"start": float(t["start"]), "end": float(t["end"]), "speaker": "Speaker_00", "text": t["text"].strip()}
+            for t in transcript
+            if t.get("text", "").strip()
+        ]
+
+    aligned: List[Dict[str, Any]] = []
+    for t in transcript:
+        text = (t.get("text") or "").strip()
+        if not text:
+            continue
+        t_start, t_end = float(t["start"]), float(t["end"])
+        best = "Speaker_00"
+        max_overlap = 0.0
+        for d in diar:
+            a0, a1 = t_start, t_end
+            b0, b1 = float(d["start"]), float(d["end"])
+            overlap = max(0.0, min(a1, b1) - max(a0, b0))
             if overlap > max_overlap:
                 max_overlap = overlap
-                best_speaker = d_segment["speaker"]
-        start_time = str(timedelta(seconds=int(t_start)))
-        aligned_line = f"[{start_time}] {best_speaker}: {text}"
-        print(f"Aligned segment {i}: {aligned_line}")
-        aligned_transcript.append(aligned_line)
-    print(f"Alignment complete. Total aligned segments: {len(aligned_transcript)}")
-    return aligned_transcript
+                best = d["speaker"]
+        aligned.append({"start": t_start, "end": t_end, "speaker": best, "text": text})
+    return aligned
 
-def save_transcript(transcript_lines, video_title):
-    """Save the transcript to a text file with a unique name based on video title."""
-    print(f"\nStarting transcript save...")
-    sanitized_title = sanitize_filename(video_title)
-    output_file = f"{sanitized_title}.txt"
-    print(f"Target output file: {output_file}")
-    try:
-        base, ext = os.path.splitext(output_file)
-        counter = 1
-        unique_output_file = output_file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        if os.path.exists(output_file):
-            unique_output_file = f"{base}_{timestamp}{ext}"
-            print(f"Output file {output_file} exists. Using unique name: {unique_output_file}")
-        while os.path.exists(unique_output_file):
-            unique_output_file = f"{base}_{timestamp}_{counter}{ext}"
-            print(f"File {unique_output_file} exists. Trying next: {unique_output_file}")
-            counter += 1
-        print(f"Writing transcript to {unique_output_file}...")
-        with open(unique_output_file, "w", encoding="utf-8") as f:
-            for i, line in enumerate(transcript_lines, 1):
-                f.write(line + "\n")
-                print(f"Wrote line {i}: {line}")
-        file_size = os.path.getsize(unique_output_file)
-        print(f"Transcript saved to {unique_output_file}, size: {file_size} bytes")
-        return unique_output_file
-    except Exception as e:
-        print(f"[ERROR] in saving transcript: {e}")
-        sys.exit(1)
+def write_txt(aligned: List[Dict[str, Any]], out_path: Path) -> Path:
+    with out_path.open("w", encoding="utf-8") as f:
+        for item in aligned:
+            f.write(f"[{hhmmss(item['start'])}] {item['speaker']}: {item['text']}\n")
+    return out_path
 
-def main():
-    print(f"\nStarting YouTube audio transcription script...")
-    parser = argparse.ArgumentParser(description="Transcribe YouTube audio to text with speaker diarization")
-    parser.add_argument("url", help="YouTube URL to process")
-    parser.add_argument("--skip-download", action="store_true", help="Skip downloading if video and MP3 files exist")
+def write_srt(aligned: List[Dict[str, Any]], out_path: Path) -> Path:
+    def fmt_srt_time(t: float) -> str:
+        t = max(0.0, t)
+        ms = int((t - int(t)) * 1000)
+        td = timedelta(seconds=int(t))
+        hours, rem = divmod(int(td.total_seconds()), 3600)
+        minutes, secs = divmod(rem, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+    with out_path.open("w", encoding="utf-8") as f:
+        for i, item in enumerate(aligned, 1):
+            f.write(f"{i}\n")
+            f.write(f"{fmt_srt_time(item['start'])} --> {fmt_srt_time(item['end'])}\n")
+            f.write(f"{item['speaker']}: {item['text']}\n\n")
+    return out_path
+
+def write_json(aligned: List[Dict[str, Any]], out_path: Path, meta: Dict[str, Any]) -> Path:
+    payload = {"meta": meta, "segments": aligned}
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return out_path
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="YouTube → Diarization → Whisper transcript with speaker labels.")
+    parser.add_argument("url", help="YouTube URL")
+    parser.add_argument("--audio", default=None, help="Path to a local audio file (.mp3/.wav/.m4a). Skips download.")
+    parser.add_argument("--skip-download", action="store_true", help="(Deprecated by --audio/local-detect) Skip download if audio exists.")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="Inference device.")
+    parser.add_argument("--whisper-model", default="base", help="Whisper model size (tiny, base, small, medium, large).")
+    parser.add_argument("--language", default=None, help="Language hint for Whisper (e.g., en, fr).")
+    parser.add_argument("--no-diarization", action="store_true", help="Disable diarization (all text Speaker_00).")
+    parser.add_argument("--hf-token", default=None, help="Hugging Face token (or set HF_TOKEN/HUGGINGFACE_TOKEN).")
+    parser.add_argument("--diarization-model", default="pyannote/speaker-diarization-3.1", help="pyannote pipeline id.")
+    parser.add_argument("--max-speakers", type=int, default=None, help="Hint for number of speakers (if supported).")
+    parser.add_argument("--output", nargs="+", choices=["txt", "srt", "json"], default=["txt"], help="Output formats.")
+    parser.add_argument("--outdir", default="outputs", help="Base output directory.")
     args = parser.parse_args()
-    print(f"Arguments: URL={args.url}, Skip Download={args.skip_download}")
 
-    print(f"\nProcessing audio download...")
-    mp3_path, video_title = download_youtube_audio(args.url, skip_download=args.skip_download)
+    start_ts = time.time()
+    device = pick_device(args.device)
+    log(f"Device: {device} (CUDA available: {torch.cuda.is_available()})")
 
-    print(f"\nConverting audio to WAV...")
-    wav_path = convert_to_wav(mp3_path, video_title)
+    base_out = Path(args.outdir).resolve()
+    # Resolve audio source first (local reuse if possible)
+    audio_path, title = resolve_audio_source(args.url, base_out, args.audio)
 
-    print(f"\nPerforming speaker diarization...")
-    diarization_segments = diarize_audio(wav_path)
+    # Per-video directory using sanitized title
+    video_dir = base_out / sanitize_filename(title)
+    video_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nTranscribing audio...")
-    transcript_segments = transcribe_audio(wav_path, model_name="base")
+    # If the audio isn't already under the per-video dir, keep it where it is; we'll export WAV there.
+    wav_path = ensure_wav(audio_path, video_dir, title)
 
-    print(f"\nAligning transcript with speakers...")
-    aligned_transcript = align_transcript_with_speakers(transcript_segments, diarization_segments)
+    # Diarization (optional)
+    diar_segments: List[Dict[str, Any]] = []
+    if args.no_diarization:
+        log("Diarization disabled by flag.")
+    else:
+        if not _HAS_PYANNOTE:
+            err("pyannote.audio not available; continuing without diarization (use --no-diarization to silence this).")
+        else:
+            diar_segments = diarize(wav_path, device, args.hf_token, args.diarization_model, args.max_speakers)
 
-    print(f"\nSaving transcript...")
-    save_transcript(aligned_transcript, video_title)
+    # Transcribe
+    trans_segments = transcribe(wav_path, device, args.whisper_model, args.language)
 
-    # Calculate and report total execution time
-    end_time = time.time()
-    execution_time = end_time - start_time
-    print(f"\nCleanup skipped for debugging. Check MP3 ({mp3_path}), WAV ({wav_path}), and video files manually.")
-    print(f"Script execution completed successfully. Total execution time: {execution_time:.2f} seconds.")
+    # Align
+    aligned = align(trans_segments, diar_segments)
+
+    # Write outputs
+    meta = {
+        "title": title,
+        "url": args.url,
+        "created": _now(),
+        "device": str(device),
+        "whisper_model": args.whisper_model,
+        "language": args.language,
+        "diarization_model": None if args.no_diarization else args.diarization_model,
+        "max_speakers": args.max_speakers,
+        "cuda": torch.cuda.is_available(),
+    }
+
+    written: List[Path] = []
+    stem = sanitize_filename(title)
+    if "txt" in args.output:
+        written.append(write_txt(aligned, video_dir / f"{stem}.txt"))
+    if "srt" in args.output:
+        written.append(write_srt(aligned, video_dir / f"{stem}.srt"))
+    if "json" in args.output:
+        written.append(write_json(aligned, video_dir / f"{stem}.json", meta))
+
+    elapsed = time.time() - start_ts
+    log("Done.")
+    log(f"Wrote: {', '.join(p.name for p in written)}")
+    log(f"Total time: {elapsed:.2f} sec")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        err("Interrupted.")
+        sys.exit(130)
+    except SystemExit as se:
+        raise
+    except Exception as e:
+        err(str(e))
+        sys.exit(1)
